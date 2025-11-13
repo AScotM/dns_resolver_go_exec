@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -18,32 +19,32 @@ import (
 type DNSRecordType uint16
 
 const (
-	DNSTypeA     DNSRecordType = 1
-	DNSTypeNS    DNSRecordType = 2
-	DNSTypeCNAME DNSRecordType = 5
-	DNSTypeSOA   DNSRecordType = 6
-	DNSTypePTR   DNSRecordType = 12
-	DNSTypeMX    DNSRecordType = 15
-	DNSTypeTXT   DNSRecordType = 16
-	DNSTypeAAAA  DNSRecordType = 28
-	DNSTypeSRV   DNSRecordType = 33
-	DNSTypeDNAME DNSRecordType = 39
-	DNSTypeDS    DNSRecordType = 43
-	DNSTypeRRSIG DNSRecordType = 46
-	DNSTypeNSEC  DNSRecordType = 47
+	DNSTypeA      DNSRecordType = 1
+	DNSTypeNS     DNSRecordType = 2
+	DNSTypeCNAME  DNSRecordType = 5
+	DNSTypeSOA    DNSRecordType = 6
+	DNSTypePTR    DNSRecordType = 12
+	DNSTypeMX     DNSRecordType = 15
+	DNSTypeTXT    DNSRecordType = 16
+	DNSTypeAAAA   DNSRecordType = 28
+	DNSTypeSRV    DNSRecordType = 33
+	DNSTypeDNAME  DNSRecordType = 39
+	DNSTypeDS     DNSRecordType = 43
+	DNSTypeRRSIG  DNSRecordType = 46
+	DNSTypeNSEC   DNSRecordType = 47
 	DNSTypeDNSKEY DNSRecordType = 48
-	DNSTypeHTTPS DNSRecordType = 65
-	DNSTypeANY   DNSRecordType = 255
+	DNSTypeHTTPS  DNSRecordType = 65
+	DNSTypeANY    DNSRecordType = 255
 )
 
 type DNSRecord struct {
-	Name       string
-	Type       DNSRecordType
-	TTL        uint32
-	Data       interface{}
-	Section    string
-	Preference *uint16
-	RData      []byte
+	Name       string        `json:"name"`
+	Type       DNSRecordType `json:"type"`
+	TypeName   string        `json:"type_name"`
+	TTL        uint32        `json:"ttl"`
+	Data       interface{}   `json:"data"`
+	Section    string        `json:"section"`
+	Preference *uint16       `json:"preference,omitempty"`
 }
 
 type SOAData struct {
@@ -85,6 +86,7 @@ type DNSResolver struct {
 	ValidateDNSSEC bool
 	MaxRedirects   int
 	queryStats     map[string]int
+	statsMutex     sync.RWMutex
 }
 
 var dnsTypeMap = map[string]DNSRecordType{
@@ -104,6 +106,25 @@ var dnsTypeMap = map[string]DNSRecordType{
 	"DNSKEY": DNSTypeDNSKEY,
 	"HTTPS":  DNSTypeHTTPS,
 	"ANY":    DNSTypeANY,
+}
+
+var dnsTypeToString = map[DNSRecordType]string{
+	DNSTypeA:      "A",
+	DNSTypeNS:     "NS",
+	DNSTypeCNAME:  "CNAME",
+	DNSTypeSOA:    "SOA",
+	DNSTypePTR:    "PTR",
+	DNSTypeMX:     "MX",
+	DNSTypeTXT:    "TXT",
+	DNSTypeAAAA:   "AAAA",
+	DNSTypeSRV:    "SRV",
+	DNSTypeDNAME:  "DNAME",
+	DNSTypeDS:     "DS",
+	DNSTypeRRSIG:  "RRSIG",
+	DNSTypeNSEC:   "NSEC",
+	DNSTypeDNSKEY: "DNSKEY",
+	DNSTypeHTTPS:  "HTTPS",
+	DNSTypeANY:    "ANY",
 }
 
 func NewDNSResolver() *DNSResolver {
@@ -265,7 +286,6 @@ func (r *DNSResolver) ParseName(data []byte, offset int) (string, int) {
 func (r *DNSResolver) ParseRecordData(rtype DNSRecordType, rdata []byte, packet []byte, rdataStart int) interface{} {
 	defer func() {
 		if recover() != nil {
-			fmt.Printf("Failed to parse record type %d, returning hex\n", rtype)
 		}
 	}()
 
@@ -473,13 +493,18 @@ func (r *DNSResolver) ParseResponse(data []byte, tid uint16) []DNSRecord {
 			}
 
 			parsedData := r.ParseRecordData(rtype, rdata, data, rdataStart)
+			typeName := dnsTypeToString[rtype]
+			if typeName == "" {
+				typeName = fmt.Sprintf("TYPE%d", rtype)
+			}
+
 			record := DNSRecord{
-				Name:    name,
-				Type:    rtype,
-				TTL:     ttl,
-				Data:    parsedData,
-				Section: section.name,
-				RData:   rdata,
+				Name:     name,
+				Type:     rtype,
+				TypeName: typeName,
+				TTL:      ttl,
+				Data:     parsedData,
+				Section:  section.name,
 			}
 
 			if rtype == DNSTypeMX {
@@ -610,7 +635,9 @@ func (r *DNSResolver) Resolve(domain string, queryType interface{}, server strin
 
 	for attempt := 0; attempt < r.Retries; attempt++ {
 		for _, currentServer := range servers {
+			r.statsMutex.Lock()
 			r.queryStats[currentServer]++
+			r.statsMutex.Unlock()
 
 			query, tid := r.BuildQuery(domain, qType)
 			startTime := time.Now()
@@ -669,31 +696,21 @@ func (r *DNSResolver) Query(domain string, queryType interface{}, server string,
 		case string:
 			qtypeStr = v
 		case DNSRecordType:
-			for k, val := range dnsTypeMap {
-				if val == v {
-					qtypeStr = k
-					break
-				}
-			}
+			qtypeStr = dnsTypeToString[v]
 		case []string:
 			qtypeStr = v
 		case []DNSRecordType:
 			var types []string
 			for _, qt := range v {
-				for k, val := range dnsTypeMap {
-					if val == qt {
-						types = append(types, k)
-						break
-					}
-				}
+				types = append(types, dnsTypeToString[qt])
 			}
 			qtypeStr = types
 		}
 
 		result := map[string]interface{}{
-			"domain":    domain,
+			"domain":     domain,
 			"query_type": qtypeStr,
-			"records":   records,
+			"records":    records,
 		}
 		jsonData, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(jsonData))
@@ -705,23 +722,13 @@ func (r *DNSResolver) Query(domain string, queryType interface{}, server string,
 	case string:
 		typeStr = v
 	case DNSRecordType:
-		for k, val := range dnsTypeMap {
-			if val == v {
-				typeStr = k
-				break
-			}
-		}
+		typeStr = dnsTypeToString[v]
 	case []string:
 		typeStr = strings.Join(v, ",")
 	case []DNSRecordType:
 		var types []string
 		for _, qt := range v {
-			for k, val := range dnsTypeMap {
-				if val == qt {
-					types = append(types, k)
-					break
-				}
-			}
+			types = append(types, dnsTypeToString[qt])
 		}
 		typeStr = strings.Join(types, ",")
 	}
@@ -743,7 +750,7 @@ func (r *DNSResolver) Query(domain string, queryType interface{}, server string,
 			fmt.Printf("\n;; %s Section:\n", strings.Title(secName))
 			for _, rec := range sections[secName] {
 				if verbose {
-					fmt.Printf("%s\t%d\t%v\n", rec.Name, rec.TTL, rec.Data)
+					fmt.Printf("%s\t%d\tIN\t%s\t%v\n", rec.Name, rec.TTL, rec.TypeName, rec.Data)
 				} else {
 					fmt.Printf("%v\n", rec.Data)
 				}
@@ -754,7 +761,13 @@ func (r *DNSResolver) Query(domain string, queryType interface{}, server string,
 }
 
 func (r *DNSResolver) GetStats() map[string]int {
-	return r.queryStats
+	r.statsMutex.RLock()
+	defer r.statsMutex.RUnlock()
+	stats := make(map[string]int)
+	for k, v := range r.queryStats {
+		stats[k] = v
+	}
+	return stats
 }
 
 func validateServerString(serverStr string) string {
@@ -784,15 +797,15 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	var (
-		domain        string
-		queryType     string
-		server        string
-		useTCP        bool
-		validateDNSSEC bool
-		noFollowCnames bool
-		verbose       bool
-		jsonOutput    bool
-		debug         bool
+		domain          string
+		queryType       string
+		server          string
+		useTCP          bool
+		validateDNSSEC  bool
+		noFollowCnames  bool
+		verbose         bool
+		jsonOutput      bool
+		debug           bool
 	)
 
 	flag.StringVar(&domain, "domain", "", "Domain name to query")
@@ -838,6 +851,11 @@ func main() {
 	resolver := NewDNSResolver()
 	resolver.UseTCP = useTCP
 	resolver.ValidateDNSSEC = validateDNSSEC
+
+	if debug {
+		fmt.Fprintf(os.Stderr, "Debug: Resolving %s type %s via %s\n", 
+			domain, queryType, validatedServer)
+	}
 
 	resolver.Query(domain, queryTypes, validatedServer, verbose, jsonOutput, !noFollowCnames)
 }
